@@ -196,197 +196,142 @@ def _pillar_num_from_line(s: str):
 
 
 def parse_report(text: str) -> dict:
-    pillar_names = {
-        "1": "Governance & Control",
-        "2": "Security",
-        "3": "Reliability",
-        "4": "Cost Optimization",
-        "5": "Observability",
-        "6": "Performance & Context",
-    }
-
-    pillars = []
+    """
+    Parse the cost review report into structured data.
+    Handles C-XXX check IDs grouped into a single Cost Optimization pillar.
+    """
+    checks = []
     overall_score = None
     action_items = []
-    current_pillar = None
+    seen_ids = set()
     in_actions = False
+    last_check_idx = None  # index into checks[] for appending recommendations
 
     for line in text.split("\n"):
         s = line.strip()
         if not s:
             continue
 
-        # Overall score — guard against matching per-pillar score lines
-        num = _pillar_num_from_line(s)
-        if not num:
+        # ── Overall score ────────────────────────────────────────────
+        if not overall_score:
             m = (
-                re.search(r"TOTAL[^\d]*(\d+)\s*/\s*(\d+)", s)
-                or re.search(r"[Oo]verall\b.*?(\d+)\s*/\s*(\d+)", s)
-                or re.search(r"(\d+)\s*/\s*(23)\s+checks", s)
-                or re.search(r"(\d+)\s*/\s*(\d+)\s+(?:pillars?|checks?)\s+pass", s)
+                re.search(r"(\d+)\s*/\s*(\d+)\s+checks?\s+pass", s, re.IGNORECASE)
+                or re.search(r"TOTAL[^\d]*(\d+)\s*/\s*(\d+)", s)
+                or re.search(r"\*\*(\d+)\s*/\s*(\d+)\s+checks?\s+pass", s, re.IGNORECASE)
+                or re.search(r"(\d+)\s*/\s*(\d+)\s+passing", s, re.IGNORECASE)
             )
             if m:
                 overall_score = (int(m.group(1)), int(m.group(2)))
-                continue
 
-        # Pillar header — "### Pillar 1 — Name" OR "#### **P1: Name — STATUS**"
-        if num:
-            status_str = s.upper()
-            if "FAIL" in status_str or "❌" in status_str:
-                status = "fail"
-            elif "WARN" in status_str or "⚠" in status_str:
-                status = "warn"
-            else:
-                status = "pass"
-            score_m = re.search(r"(\d+)/(\d+)", s)
-            pillar = {
-                "num": num,
-                "name": pillar_names.get(num, f"Pillar {num}"),
-                "status": status,
-                "pass": int(score_m.group(1)) if score_m else 0,
-                "total": int(score_m.group(2)) if score_m else 0,
-                "checks": [],
-            }
-            pillars.append(pillar)
-            current_pillar = pillar
-            in_actions = False
+        # ── Section header: ### **[C-001] Name** or ### [C-001] Name ─
+        m = re.match(r"#{1,4}\s*\**\s*\[?(C-\d+)\]?\s*\**\s*(.+)", s)
+        if m:
+            check_id = m.group(1)
+            name = re.sub(r"[\*\[\]]", "", m.group(2)).strip().strip("*").strip()
+            if check_id not in seen_ids:
+                seen_ids.add(check_id)
+                checks.append({
+                    "status": "fail",   # finding sections are failures
+                    "id": check_id,
+                    "name": name,
+                    "recommendation": None,
+                })
+                last_check_idx = len(checks) - 1
             continue
 
-        # Status line after pillar header: "**Status:** 4/5 checks passing"
-        if current_pillar and re.search(r"status", s, re.IGNORECASE) and current_pillar["total"] == 0:
-            sm = re.search(r"(\d+)/(\d+)", s)
-            if sm:
-                current_pillar["pass"] = int(sm.group(1))
-                current_pillar["total"] = int(sm.group(2))
+        # ── Inline check from run_cost_checks: ❌ FAIL [C-001] Name ──
+        m = re.match(r"(❌|⚠️|✅|ℹ️)\s*(FAIL|WARN|PASS|INFO)\s+\[?(C-\d+)\]?\s*(.*)", s)
+        if m:
+            emoji, status_str, check_id, name = m.group(1), m.group(2), m.group(3), m.group(4)
+            name = re.sub(r"\[cross-resource\]", "", name).strip()
+            if check_id not in seen_ids:
+                seen_ids.add(check_id)
+                checks.append({
+                    "status": status_str.lower(),
+                    "id": check_id,
+                    "name": name or check_id,
+                    "recommendation": None,
+                })
+                last_check_idx = len(checks) - 1
             continue
 
-        # Table check row: | P1-001 Name | ✅ PASS | — |  OR  | P1 | Name | ✅ PASS |
-        if s.startswith("|"):
-            if re.match(r"^\|[\s\-:|]+\|$", s):
-                continue
+        # ── Table row summary: | C-001 | Description | file | saving ─
+        if s.startswith("|") and not re.match(r"^\|[\s\-:|]+\|$", s):
             cells = [c.strip() for c in s.strip("|").split("|")]
-            if len(cells) >= 2:
-                # Detect status cell (could be cell[1] or cell[2])
-                status_cell, name_cell, id_cell = "", "", ""
-                for i, c in enumerate(cells):
-                    if any(x in c for x in ("✅", "❌", "⚠️", "ℹ️", "PASS", "FAIL", "WARN", "INFO")):
-                        status_cell = c
-                        name_cell = cells[i - 1] if i > 0 else ""
-                        break
-
-                if not status_cell:
-                    continue  # header row
-
-                id_m = re.search(r"P\d-\d+", name_cell + " ".join(cells))
-                check_id = id_m.group(0) if id_m else "—"
-                name = re.sub(r"P\d[-\s]\d+\s*", "", name_cell).strip() or name_cell
-
-                if "FAIL" in status_cell or "❌" in status_cell:
+            if cells and re.match(r"C-\d+", cells[0]):
+                check_id = re.match(r"C-\d+", cells[0]).group(0)
+                name = cells[1] if len(cells) > 1 else check_id
+                # Determine status from emoji in any cell
+                row_text = " ".join(cells)
+                if "❌" in row_text or "FAIL" in row_text:
                     cstatus = "fail"
-                elif "WARN" in status_cell or "⚠" in status_cell:
+                elif "⚠️" in row_text or "WARN" in row_text:
                     cstatus = "warn"
-                elif "PASS" in status_cell or "✅" in status_cell:
+                elif "✅" in row_text or "PASS" in row_text:
                     cstatus = "pass"
                 else:
-                    cstatus = "info"
-
-                # Find recommendation — look in cells after status
-                si = cells.index(status_cell) if status_cell in cells else -1
-                rec_cells = [c for c in cells[si+1:] if c and c != "—"] if si >= 0 else []
-                finding = rec_cells[0] if rec_cells else None
-
-                if current_pillar and name:
-                    current_pillar["checks"].append({
-                        "status": cstatus, "id": check_id,
-                        "name": name, "recommendation": finding,
+                    cstatus = "fail"  # table rows are findings → fail
+                # Saving estimate (last non-empty cell)
+                saving = next((c for c in reversed(cells) if c and c != "—"), None)
+                if check_id not in seen_ids:
+                    seen_ids.add(check_id)
+                    checks.append({
+                        "status": cstatus,
+                        "id": check_id,
+                        "name": name,
+                        "recommendation": saving if saving != name else None,
                     })
+                    last_check_idx = len(checks) - 1
             continue
 
-        # Inline check row: "❌ FAIL [P2-001] Name" or "❌ **FAIL [P2-001]:** Name"
-        m = re.match(r"(❌|⚠️|✅|ℹ️)\s*\**\s*(FAIL|WARN|PASS|INFO)\s+\[([A-Z0-9\-]+)\][:\*]*\s*\**\s*(.*)", s)
-        if m and current_pillar is not None:
-            current_pillar["checks"].append({
-                "status": m.group(2).lower(),
-                "id": m.group(3),
-                "name": re.sub(r"\*+", "", m.group(4)).strip(),
-                "recommendation": None,
-            })
+        # ── Est. saving line → attach to last check ──────────────────
+        if last_check_idx is not None and re.search(r"est\.?\s*sav", s, re.IGNORECASE):
+            saving = re.sub(r"\*+|💰", "", s).strip()
+            checks[last_check_idx]["recommendation"] = saving
             continue
 
-        # Bullet check: "- ✅ text" or "- ❌ **FAIL [P2-001]:** text"
-        m = re.match(r"[-*]\s+(✅|❌|⚠️|ℹ️)\s+(.*)", s)
-        if m and current_pillar is not None:
-            emoji, rest = m.group(1), m.group(2)
-            id_m = re.search(r"[\[(](P\d-\d+)[\])]", rest)
-            check_id = id_m.group(1) if id_m else "—"
-            if "❌" in emoji or re.search(r"\bFAIL\b", rest, re.IGNORECASE):
-                cstatus = "fail"
-            elif "⚠️" in emoji or re.search(r"\bWARN\b", rest, re.IGNORECASE):
-                cstatus = "warn"
-            elif "ℹ️" in emoji or re.search(r"\bINFO\b", rest, re.IGNORECASE):
-                cstatus = "info"
-            else:
-                cstatus = "pass"
-            name = re.sub(r"\*\*.*?\*\*\s*", "", rest)
-            name = re.sub(r"[\[(]P\d-\d+[\])].*", "", name).strip(" :")
-            if name:
-                current_pillar["checks"].append({
-                    "status": cstatus, "id": check_id,
-                    "name": name, "recommendation": None,
-                })
-            continue
-
-        # Numbered check in pillar: "1. **[P2-004] FAIL — description**"
-        m = re.match(r"\d+[.)]\s+\**\s*\[([A-Z0-9\-]+)\]\s*(FAIL|WARN|PASS|INFO)\s*[—\-–]\s*\**(.+)", s)
-        if m and current_pillar is not None:
-            name = re.sub(r"\*+$", "", m.group(3)).strip()
-            current_pillar["checks"].append({
-                "status": m.group(2).lower(), "id": m.group(1),
-                "name": name, "recommendation": None,
-            })
-            continue
-
-        # Recommendation arrow
-        if (s.startswith("→") or s.startswith("> **Recommendation")) and current_pillar and current_pillar["checks"]:
-            msg = re.sub(r"^→\s*|^>\s*\*?\*?Recommendation[:\s]*\*?\*?", "", s).strip()
-            if msg:
-                current_pillar["checks"][-1]["recommendation"] = msg
-            continue
-
-        # Action items
-        if re.search(r"(prioriti[sz]ed action|top \d|fix these first|priority \d)", s.lower()):
+        # ── Action items ─────────────────────────────────────────────
+        if re.search(r"(top \d|priority order|highest.impact|prioritized action|quick wins?)", s, re.IGNORECASE):
             in_actions = True
             continue
         if in_actions:
-            m = re.match(r"#{0,4}\s*[🔴🟠🟡#]*\s*#?\*?\*?(?:Priority\s*)?(\d+)[.):\-—\s]+\*?\*?(.+)", s)
+            # Stop at new major sections
+            if re.match(r"^#{1,2}\s", s) and not re.match(r"^###", s):
+                in_actions = False
+            m = re.match(r"#{1,4}\s*\**\s*(?:\d+[.):\-—\s]+)\**(.+)", s)
             if m:
-                action_items.append(re.sub(r"^\*+|\*+$", "", m.group(2)).strip())
+                action = re.sub(r"\*+", "", m.group(1)).strip()
+                if len(action) > 5:
+                    action_items.append(action)
             elif re.match(r"^\d+[.)]\s+", s):
-                action_items.append(re.sub(r"^\d+[.)]\s+", "", s))
+                action = re.sub(r"^\d+[.)]\s+", "", s)
+                if len(action) > 5:
+                    action_items.append(action)
 
-    # Derive pass/total and status from checks when not captured from the header
-    for p in pillars:
-        if p["total"] == 0 and p["checks"]:
-            p["total"] = len(p["checks"])
-            p["pass"] = sum(1 for c in p["checks"] if c["status"] == "pass")
-        # Re-derive status if it defaulted to "pass" but checks say otherwise
-        if p["checks"] and p["status"] == "pass":
-            statuses = {c["status"] for c in p["checks"]}
-            if "fail" in statuses:
-                p["status"] = "fail"
-            elif "warn" in statuses:
-                p["status"] = "warn"
+    # ── Build single Cost Optimization pillar ────────────────────────
+    passing = sum(1 for c in checks if c["status"] == "pass")
+    total   = len(checks) if checks else 15
+    has_fail = any(c["status"] == "fail" for c in checks)
+    has_warn = any(c["status"] == "warn" for c in checks)
+    pillar_status = "fail" if has_fail else ("warn" if has_warn else "pass")
 
-    # Fallback overall score
-    if not overall_score and pillars:
-        tp = sum(p["pass"] for p in pillars)
-        tc = sum(p["total"] for p in pillars)
-        overall_score = (tp, tc) if tc else (0, 1)
+    pillar = {
+        "num": "1",
+        "name": "Cost Optimization",
+        "status": pillar_status,
+        "pass": passing,
+        "total": total,
+        "checks": checks,
+    }
+
+    # ── Fallback overall score ────────────────────────────────────────
+    if not overall_score:
+        overall_score = (passing, total) if total else (0, 15)
 
     return {
-        "pillars": pillars,
+        "pillars": [pillar],
         "overall_score": overall_score,
-        "action_items": action_items,
+        "action_items": action_items[:5],
         "raw": text,
     }
 
@@ -396,12 +341,10 @@ def parse_report(text: str) -> dict:
 # ─────────────────────────────────────────────
 
 PILLAR_ICONS = {
-    "1": "fa-shield-halved", "2": "fa-lock",  "3": "fa-circle-check",
-    "4": "fa-coins",         "5": "fa-eye",   "6": "fa-bolt",
+    "1": "fa-coins",
 }
 PILLAR_COLORS = {
-    "1": "#3b82f6", "2": "#ef4444", "3": "#22c55e",
-    "4": "#f59e0b", "5": "#a855f7", "6": "#06b6d4",
+    "1": "#10b981",  # emerald — cost / savings
 }
 
 def _status_classes(status: str):
@@ -656,7 +599,7 @@ def generate_html(report_text: str, target_path: str) -> str:
       <a href="#actions" class="flex items-center gap-2 px-3 py-2 rounded-lg text-gray-400 hover:bg-gray-800 hover:text-white transition text-sm">
         <i class="fas fa-bullseye text-xs w-4 text-gray-500"></i><span>Priority Actions</span>
       </a>
-      <div class="text-xs font-bold uppercase tracking-widest text-gray-600 px-3 pt-3 pb-2">Pillars</div>
+      <div class="text-xs font-bold uppercase tracking-widest text-gray-600 px-3 pt-3 pb-2">Cost Checks</div>
       {nav_html}
       <div class="text-xs font-bold uppercase tracking-widest text-gray-600 px-3 pt-3 pb-2">Details</div>
       <a href="#raw" class="flex items-center gap-2 px-3 py-2 rounded-lg text-gray-400 hover:bg-gray-800 hover:text-white transition text-sm">
@@ -678,10 +621,10 @@ def generate_html(report_text: str, target_path: str) -> str:
       <div class="flex flex-col lg:flex-row lg:items-center lg:justify-between gap-6">
         <div>
           <div class="flex items-center gap-2 mb-2">
-            <i class="fas fa-shield-halved text-blue-500"></i>
-            <span class="text-xs font-bold text-blue-500 uppercase tracking-wider">Well-Architected Framework Review</span>
+            <i class="fas fa-coins text-emerald-500"></i>
+            <span class="text-xs font-bold text-emerald-500 uppercase tracking-wider">Terraform Cost Architecture Review</span>
           </div>
-          <h1 class="text-2xl font-black mb-3 text-gray-900 dark:text-white">Agent Architecture Report</h1>
+          <h1 class="text-2xl font-black mb-3 text-gray-900 dark:text-white">Cost Optimization Report</h1>
           <div class="flex items-center gap-2 bg-gray-100 dark:bg-gray-700 rounded-lg px-3 py-1.5 w-fit mb-3">
             <i class="fas fa-folder-open text-gray-400 text-xs"></i>
             <code class="text-gray-600 dark:text-gray-300 text-xs">{target_abs}</code>
@@ -689,7 +632,7 @@ def generate_html(report_text: str, target_path: str) -> str:
           <div class="text-gray-400 text-sm">
             <i class="fas fa-clock mr-1"></i>{timestamp}
             &nbsp;·&nbsp;
-            <i class="fas fa-robot mr-1"></i>claude-sonnet-4-6
+            <i class="fas fa-robot mr-1"></i>claude-haiku-4-5
           </div>
         </div>
         <div class="flex-shrink-0 bg-gray-50 dark:bg-gray-700 border border-gray-200 dark:border-gray-600 rounded-2xl p-6 text-center min-w-[150px]">
@@ -763,7 +706,7 @@ def generate_html(report_text: str, target_path: str) -> str:
 def save_report(report_text: str, target_path: str, output_dir: str = ".") -> str:
     timestamp = datetime.now().strftime("%Y%m%d_%H%M%S")
     target_name = os.path.basename(os.path.abspath(target_path))
-    filename = f"waf_review_{target_name}_{timestamp}.html"
+    filename = f"cost_review_{target_name}_{timestamp}.html"
     output_path = os.path.join(output_dir, filename)
     with open(output_path, "w", encoding="utf-8") as f:
         f.write(generate_html(report_text, target_path))
