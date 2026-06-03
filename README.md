@@ -2,7 +2,7 @@
 
 An AI agent that reads your Terraform codebase and identifies **architectural cost anti-patterns** that standard security scanners like Checkov, tfsec, and Trivy cannot detect.
 
-Powered by Claude (Haiku 4.5). Produces a scored HTML report with specific file references, estimated monthly savings, and concrete fixes.
+Powered by Claude (Haiku 4.5). Produces a scored HTML report with specific file references, estimated monthly savings, and concrete fixes. Runs **21 checks** across compute, storage, networking, database, and architecture patterns.
 
 ---
 
@@ -18,7 +18,7 @@ That's the gap this tool fills.
 
 ---
 
-## What It Catches (15 Checks)
+## What It Catches (21 Checks)
 
 All checks focus on cost inefficiencies that require understanding resource relationships — not just per-resource attributes.
 
@@ -39,6 +39,12 @@ All checks focus on cost inefficiencies that require understanding resource rela
 | C-013 | No reserved capacity for stable long-running resources | Single-resource | 40–60% on RDS/ElastiCache |
 | C-014 | Multi-AZ RDS enabled on apparent non-production environments | Single-resource | 50% RDS cost in non-prod |
 | C-015 | Large S3 buckets without Intelligent-Tiering lifecycle rule | Single-resource | 40–68% on infrequent objects |
+| C-016 | Step Functions `STANDARD` type for high-volume workflows (vs `EXPRESS`) | Cross-resource | 10–1000x cost reduction |
+| C-017 | API Gateway stage with caching disabled — every request hits Lambda | Cross-resource | 50–90% Lambda invocations |
+| C-018 | SQS short polling (`receive_wait_time_seconds = 0`) — empty API calls billed | Single-resource | $5–50/mo per high-traffic queue |
+| C-019 | ECR repository without lifecycle policy — images accumulate indefinitely | Cross-resource | $10–200/mo per busy pipeline |
+| C-020 | Kinesis Data Stream with fixed shard count instead of On-Demand mode | Single-resource | 40–80% Kinesis cost |
+| C-021 | ECS/EKS workloads using on-demand only — no Spot capacity provider | Cross-resource | 40–70% compute cost |
 
 ---
 
@@ -135,26 +141,51 @@ Est. saving:  ~$14/mo (scales with message volume)
 - Python 3.10+
 - An Anthropic API key ([get one here](https://console.anthropic.com))
 
+> **Cost:** a typical run uses ~15k–40k tokens with Haiku 4.5 — roughly **$0.01–0.05 per scan**.
+
 ### Install
 
 ```bash
+# Option A — from GitHub
+pip install git+https://github.com/wb-platform-engineering-lab/agent-terraform-cost-reviewer.git
+
+# Option B — from source
 git clone https://github.com/wb-platform-engineering-lab/agent-terraform-cost-reviewer.git
 cd agent-terraform-cost-reviewer
-pip install -r requirements.txt
+pip install .
+
+# macOS (Homebrew Python — externally managed)
+python3 -m venv .venv && source .venv/bin/activate
+pip install .
+```
+
+### Configure
+
+```bash
 export ANTHROPIC_API_KEY=your-key-here
 ```
 
 ### Run
 
 ```bash
-# Against the included bad example (triggers all 15 checks)
-bash run.sh
-
 # Against your own Terraform codebase
-python3 agent.py ./path/to/your/terraform
+terraform-cost-review ./path/to/your/terraform
 
-# Against the good example (passes all checks)
-python3 agent.py ./examples/good_infra
+# Fail CI if score drops below 80%
+terraform-cost-review ./terraform --fail-under 80 --output-dir reports/
+
+# Quiet mode (spinner + one summary line — ideal for CI)
+terraform-cost-review ./terraform --quiet --output-dir reports/
+
+# Fixed output filename (useful in CI for predictable artifact paths)
+terraform-cost-review ./terraform --output-file cost-report --output-dir reports/
+
+# Check version
+terraform-cost-review --version
+
+# Against the included examples
+terraform-cost-review ./examples/bad_infra   # → 0/21, all findings
+terraform-cost-review ./examples/good_infra  # → 19/21, near perfect
 ```
 
 ---
@@ -163,17 +194,19 @@ python3 agent.py ./examples/good_infra
 
 ```
 agent-terraform-cost-reviewer/
-├── agent.py                   — Agent loop, system prompt, token management
-├── rubric.py                  — 15 cost checks with patterns and savings estimates
-├── tools.py                   — Tool implementations:
-│                                  list_files, read_file, search_code,
-│                                  build_resource_graph, run_cost_checks
-├── report.py                  — HTML report generator (Tailwind CSS + Font Awesome)
-├── requirements.txt
-├── run.sh                     — Demo script
+├── pyproject.toml                        — Package definition, entry point
+├── Makefile                              — make install / make demo / make test
+├── agent.py                              — Backward-compat shim (python3 agent.py still works)
+├── run.sh                                — Demo script
+├── terraform_cost_reviewer/              — Installable package
+│   ├── __init__.py                       — Version
+│   ├── cli.py                            — Agent loop, CLI flags, error handling
+│   ├── rubric.py                         — 21 cost checks with patterns and savings estimates
+│   ├── tools.py                          — list_files, read_file, build_resource_graph, run_cost_checks
+│   └── report.py                         — HTML + JSON report generator (Tailwind CSS)
 └── examples/
-    ├── bad_infra/main.tf      — Intentionally violates all 15 checks
-    └── good_infra/main.tf     — Passes all 15 checks
+    ├── bad_infra/main.tf                 — Violates all 21 checks (score: 0%)
+    └── good_infra/main.tf                — Passes all checks (score: ~90%)
 ```
 
 ---

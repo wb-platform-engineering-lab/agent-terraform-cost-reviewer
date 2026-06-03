@@ -349,7 +349,7 @@ def build_resource_graph(path: str) -> str:
 
 def run_cost_checks(path: str) -> str:
     """Run all rubric checks against the Terraform codebase and return structured findings."""
-    from rubric import CHECKS
+    from .rubric import CHECKS
 
     # Collect all Terraform source
     all_code = ""

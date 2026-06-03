@@ -781,12 +781,9 @@ def generate_html(report_text: str, target_path: str) -> str:
 
 
 def save_report(report_text: str, target_path: str, output_dir: str = ".", base_name: str | None = None) -> str:
-    if base_name:
-        filename = f"{base_name}.html"
-    else:
-        timestamp = datetime.now().strftime("%Y%m%d_%H%M%S")
-        target_name = os.path.basename(os.path.abspath(target_path))
-        filename = f"cost_review_{target_name}_{timestamp}.html"
+    timestamp = datetime.now().strftime("%Y%m%d_%H%M%S")
+    target_name = os.path.basename(os.path.abspath(target_path))
+    filename = f"cost_review_{target_name}_{timestamp}.html"
     output_path = os.path.join(output_dir, filename)
     with open(output_path, "w", encoding="utf-8") as f:
         f.write(generate_html(report_text, target_path))

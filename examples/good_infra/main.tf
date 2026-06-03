@@ -36,6 +36,7 @@ resource "aws_lambda_event_source_mapping" "sqs_trigger" {
 resource "aws_sqs_queue" "jobs" {
   name                       = "job-queue"
   visibility_timeout_seconds = 300
+  receive_wait_time_seconds  = 20  # C-018: long polling — eliminates empty ReceiveMessage API calls
   redrive_policy = jsonencode({
     deadLetterTargetArn = aws_sqs_queue.jobs_dlq.arn
     maxReceiveCount     = 3
@@ -263,6 +264,99 @@ resource "aws_s3_bucket_lifecycle_configuration" "artifacts_intelligent_tiering"
       days          = 0
       storage_class = "INTELLIGENT_TIERING"
     }
+  }
+}
+
+# C-016: Step Functions EXPRESS type — ~750x cheaper than STANDARD for high-volume
+resource "aws_sfn_state_machine" "order_flow" {
+  name     = "order-processing"
+  role_arn = aws_iam_role.lambda_role.arn
+  type     = "EXPRESS"
+  definition = jsonencode({
+    Comment = "Order processing workflow"
+    StartAt = "ProcessOrder"
+    States = {
+      ProcessOrder = { Type = "Task", Resource = aws_lambda_function.processor.arn, End = true }
+    }
+  })
+}
+
+# C-017: API Gateway with caching enabled — reduces Lambda invocations 50–90%
+resource "aws_api_gateway_rest_api" "api" {
+  name = "my-api"
+}
+
+resource "aws_api_gateway_stage" "prod" {
+  rest_api_id           = aws_api_gateway_rest_api.api.id
+  stage_name            = "prod"
+  deployment_id         = "placeholder"
+  cache_cluster_enabled = true
+  cache_cluster_size    = "0.5"
+}
+
+# C-019: ECR with lifecycle policy — keeps only last 10 tagged images, expires untagged after 1 day
+resource "aws_ecr_repository" "app" {
+  name                 = "my-app"
+  image_tag_mutability = "IMMUTABLE"
+}
+
+resource "aws_ecr_lifecycle_policy" "app" {
+  repository = aws_ecr_repository.app.name
+
+  policy = jsonencode({
+    rules = [
+      {
+        rulePriority = 1
+        description  = "Expire untagged images after 1 day"
+        selection = {
+          tagStatus   = "untagged"
+          countType   = "sinceImagePushed"
+          countUnit   = "days"
+          countNumber = 1
+        }
+        action = { type = "expire" }
+      },
+      {
+        rulePriority = 2
+        description  = "Keep only last 10 tagged images"
+        selection = {
+          tagStatus   = "tagged"
+          tagPrefixList = ["v"]
+          countType   = "imageCountMoreThan"
+          countNumber = 10
+        }
+        action = { type = "expire" }
+      }
+    ]
+  })
+}
+
+# C-020: Kinesis On-Demand — scales automatically, no over-provisioned shards
+resource "aws_kinesis_stream" "events" {
+  name = "event-stream"
+
+  stream_mode_details {
+    stream_mode = "ON_DEMAND"
+  }
+}
+
+# C-021: ECS service with mixed Spot/on-demand strategy — 60-70% compute savings
+resource "aws_ecs_service" "api" {
+  name            = "api-service"
+  cluster         = "my-cluster"
+  task_definition = aws_ecs_task_definition.api.arn
+  desired_count   = 3
+
+  capacity_provider_strategy {
+    capacity_provider = "FARGATE_SPOT"
+    weight            = 70
+    base              = 0
+  }
+
+  capacity_provider_strategy {
+    capacity_provider = "FARGATE"
+    weight            = 30
+    base              = 1  # keep at least 1 on-demand task for stability
   }
 }
 

@@ -58,7 +58,8 @@ resource "aws_cloudwatch_event_target" "invoke_lambda" {
 }
 
 resource "aws_sqs_queue" "jobs" {
-  name = "job-queue"
+  name                      = "job-queue"
+  receive_wait_time_seconds = 0  # C-018: short polling — every poll billed even when queue empty
   # No DLQ
 }
 
@@ -179,6 +180,60 @@ resource "aws_eip" "nat_a" { vpc = true }
 resource "aws_eip" "nat_b" { vpc = true }
 resource "aws_eip" "nat_c" { vpc = true }
 resource "aws_eip" "spare" { vpc = true }  # idle — never associated
+
+# C-016: Step Functions STANDARD type — expensive for high-volume workflows
+resource "aws_sfn_state_machine" "order_flow" {
+  name     = "order-processing"
+  role_arn = aws_iam_role.lambda_role.arn
+  type     = "STANDARD"
+  # At 1M executions/day: ~$750/mo vs ~$1/mo with EXPRESS
+  definition = jsonencode({
+    Comment = "Order processing workflow"
+    StartAt = "ProcessOrder"
+    States = {
+      ProcessOrder = { Type = "Task", Resource = aws_lambda_function.processor.arn, End = true }
+    }
+  })
+}
+
+# C-017: API Gateway stage with caching disabled
+resource "aws_api_gateway_rest_api" "api" {
+  name = "my-api"
+}
+
+resource "aws_api_gateway_stage" "prod" {
+  rest_api_id          = aws_api_gateway_rest_api.api.id
+  stage_name           = "prod"
+  deployment_id        = "placeholder"
+  cache_cluster_enabled = false  # every request hits Lambda — no caching benefit
+  # cache_cluster_size not set — missing 50–90% Lambda invocation savings
+}
+
+# C-019: ECR repository with no lifecycle policy — images accumulate forever
+resource "aws_ecr_repository" "app" {
+  name                 = "my-app"
+  image_tag_mutability = "MUTABLE"
+  # No aws_ecr_lifecycle_policy — CI/CD pushes accumulate GB of old images
+}
+
+# C-020: Kinesis stream with fixed shards — should use ON_DEMAND for variable traffic
+resource "aws_kinesis_stream" "events" {
+  name        = "event-stream"
+  shard_count = 10
+  # Fixed provisioned shards: 10 × $0.015/hr = $108/mo regardless of actual throughput
+  # Should use stream_mode_details block with on-demand mode instead
+}
+
+# C-021: ECS service with no Spot capacity — 100% on-demand pricing
+resource "aws_ecs_service" "api" {
+  name            = "api-service"
+  cluster         = "my-cluster"
+  task_definition = aws_ecs_task_definition.api.arn
+  desired_count   = 3
+  launch_type     = "FARGATE"
+  # All tasks run on on-demand capacity — no mixed Spot strategy configured
+  # Missing 60-70% compute savings from using a Spot capacity provider
+}
 
 # Minimal networking boilerplate
 resource "aws_subnet" "public_a"  { vpc_id = "vpc-xxx" cidr_block = "10.0.1.0/24" availability_zone = "us-east-1a" }
