@@ -7,6 +7,7 @@
 # Optional CI/CD variables:
 #   COST_REVIEW_PATH        — path to Terraform codebase (default: ".")
 #   COST_REVIEW_FAIL_UNDER  — fail pipeline if score below N% (default: unset = never fail)
+#   GITLAB_TOKEN            — project/personal token for posting MR notes (optional)
 # ─────────────────────────────────────────────────────────────────────────────
 
 stages:
@@ -17,40 +18,35 @@ terraform-cost-review:
   image: python:3.11-slim
 
   variables:
-    COST_REVIEW_PATH: ${COST_REVIEW_PATH:-"."}
     PIP_CACHE_DIR: "$CI_PROJECT_DIR/.cache/pip"
+    # Override COST_REVIEW_PATH in CI/CD settings to point at a subdirectory
+    COST_REVIEW_PATH: "."
 
   cache:
-    key: pip-cache
+    key:
+      files:
+        - pyproject.toml
     paths:
       - .cache/pip
 
   before_script:
     - pip install . --quiet
+    - mkdir -p reports/
 
   script:
     - |
+      ARGS="${COST_REVIEW_PATH} --quiet --output-dir reports/ --output-file cost-review"
       if [ -n "${COST_REVIEW_FAIL_UNDER}" ]; then
-        terraform-cost-review "${COST_REVIEW_PATH}" \
-          --fail-under "${COST_REVIEW_FAIL_UNDER}" \
-          --quiet \
-          --output-dir reports/
-      else
-        terraform-cost-review "${COST_REVIEW_PATH}" \
-          --quiet \
-          --output-dir reports/
+        ARGS="$ARGS --fail-under ${COST_REVIEW_FAIL_UNDER}"
       fi
+      terraform-cost-review $ARGS
 
   artifacts:
     name: "cost-review-$CI_PIPELINE_IID"
-    when: always          # save report even when the job fails
+    when: always
     paths:
       - reports/
     expire_in: 30 days
-    reports:
-      # Expose the JSON summary in the pipeline UI (GitLab 15.7+)
-      # Uses dotenv format — see note below
-      dotenv: reports/cost_review.env
 
   # Only run when .tf or .tfvars files change
   rules:
@@ -65,20 +61,22 @@ terraform-cost-review:
     - if: '$CI_PIPELINE_SOURCE == "web"'   # allow manual trigger
       when: manual
 
-  # Post the score as a MR note (requires GitLab Runner with API access)
+  # Post the score as a MR note (requires GITLAB_TOKEN)
   after_script:
     - |
-      if [ -f reports/*.json ] && [ -n "${GITLAB_TOKEN}" ]; then
-        JSON=$(ls reports/*.json | head -1)
-        SCORE=$(python3 -c "import json,sys; d=json.load(open('$JSON')); print(d['score_pct'])")
-        GRADE=$(python3 -c "import json,sys; d=json.load(open('$JSON')); print(d['grade'])")
-        SAVINGS=$(python3 -c "import json,sys; d=json.load(open('$JSON')); print(d['savings_label'])")
-        FAILING=$(python3 -c "import json,sys; d=json.load(open('$JSON')); print(', '.join(d['failing_checks']) or 'none')")
-        MSG="## 💰 Terraform Cost Review — ${SCORE}% (${GRADE})\n\n| | |\n|---|---|\n| **Est. Monthly Savings** | ${SAVINGS} |\n| **Failing Checks** | ${FAILING} |\n\n_Full HTML report available as a pipeline artifact._"
-        if [ -n "${CI_MERGE_REQUEST_IID}" ]; then
-          curl --silent --request POST \
-            --header "PRIVATE-TOKEN: ${GITLAB_TOKEN}" \
-            --data-urlencode "body=${MSG}" \
-            "${CI_API_V4_URL}/projects/${CI_PROJECT_ID}/merge_requests/${CI_MERGE_REQUEST_IID}/notes"
-        fi
+      JSON="reports/cost-review.json"
+      if [ -f "$JSON" ] && [ -n "${GITLAB_TOKEN}" ] && [ -n "${CI_MERGE_REQUEST_IID}" ]; then
+        SCORE=$(python3 -c "import json; d=json.load(open('$JSON')); print(d['score_pct'])")
+        GRADE=$(python3 -c "import json; d=json.load(open('$JSON')); print(d['grade'])")
+        SAVINGS=$(python3 -c "import json; d=json.load(open('$JSON')); print(d['savings_label'])")
+        FAILING=$(python3 -c "import json; d=json.load(open('$JSON')); print(', '.join(d['failing_checks']) or 'none')")
+        MSG="## 💰 Terraform Cost Review — ${SCORE}% (${GRADE})\n\n\
+| | |\n|---|---|\n\
+| **Est. Monthly Savings** | ${SAVINGS} |\n\
+| **Failing Checks** | \`${FAILING}\` |\n\n\
+_Full HTML report available as a pipeline artifact._"
+        curl --silent --request POST \
+          --header "PRIVATE-TOKEN: ${GITLAB_TOKEN}" \
+          --data-urlencode "body=${MSG}" \
+          "${CI_API_V4_URL}/projects/${CI_PROJECT_ID}/merge_requests/${CI_MERGE_REQUEST_IID}/notes"
       fi
