@@ -1,5 +1,11 @@
 # Terraform Cost Reviewer
 
+[![License: MIT](https://img.shields.io/badge/License-MIT-yellow.svg)](LICENSE)
+[![Python](https://img.shields.io/badge/python-3.10%2B-blue.svg)](https://www.python.org/downloads/)
+[![Powered by Claude](https://img.shields.io/badge/Powered%20by-Claude%20Haiku%204.5-blueviolet.svg)](https://www.anthropic.com)
+[![Checks](https://img.shields.io/badge/cost%20checks-21-green.svg)](#what-it-catches-21-checks)
+[![CI](https://github.com/wb-platform-engineering-lab/agent-terraform-cost-reviewer/actions/workflows/cost-review.yml/badge.svg)](https://github.com/wb-platform-engineering-lab/agent-terraform-cost-reviewer/actions/workflows/cost-review.yml)
+
 An AI agent that reads your Terraform codebase and identifies **architectural cost anti-patterns** that standard security scanners like Checkov, tfsec, and Trivy cannot detect.
 
 Powered by Claude (Haiku 4.5). Produces a scored HTML report with specific file references, estimated monthly savings, and concrete fixes. Runs **21 checks** across compute, storage, networking, database, and architecture patterns.
