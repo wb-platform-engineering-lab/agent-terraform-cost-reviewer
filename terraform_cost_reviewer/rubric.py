@@ -2,14 +2,16 @@
 Cost review rubric for the Terraform Cost Reviewer.
 
 Each check defines:
-  - id:           unique identifier
-  - name:         short name
-  - description:  what the reviewer looks for
-  - severity:     FAIL | WARN | INFO
-  - patterns:     regex patterns that indicate the check PASSES
-  - anti_patterns: regex patterns that indicate a problem
-  - cross_resource: True if this check requires graph reasoning across resources
-  - est_saving:   rough monthly saving estimate
+  id            — unique identifier
+  name          — short display name
+  description   — what is being checked and why it matters
+  severity      — FAIL | WARN | INFO (used when check is not passing)
+  cross_resource — True if this check requires reasoning across multiple resources
+  est_saving    — rough monthly saving estimate (for report display)
+
+Check logic lives in tools.run_cost_checks, using the hcl2-parsed resource graph
+rather than regex on raw text. This gives accurate attribute values (bool, int, str)
+and eliminates false positives from comments or variable names.
 """
 
 CHECKS = [
@@ -24,8 +26,6 @@ CHECKS = [
             "or using a single NAT for non-prod reduces this significantly."
         ),
         "severity": "FAIL",
-        "patterns": [],
-        "anti_patterns": [r'resource\s+"aws_nat_gateway"'],
         "cross_resource": True,
         "est_saving": "$100–500/mo per redundant gateway",
     },
@@ -40,8 +40,6 @@ CHECKS = [
             "incurring data transfer charges (~$0.045/GB). VPC endpoints are free for S3/DynamoDB."
         ),
         "severity": "FAIL",
-        "patterns": [r'resource\s+"aws_vpc_endpoint"'],
-        "anti_patterns": [],
         "cross_resource": True,
         "est_saving": "$20–300/mo depending on data volume",
     },
@@ -56,8 +54,6 @@ CHECKS = [
             "Replace with aws_lambda_event_source_mapping — AWS polls for free and invokes Lambda only when messages exist."
         ),
         "severity": "FAIL",
-        "patterns": [r'resource\s+"aws_lambda_event_source_mapping"'],
-        "anti_patterns": [r'resource\s+"aws_cloudwatch_event_rule"'],
         "cross_resource": True,
         "est_saving": "$10–200/mo depending on message volume",
     },
@@ -72,8 +68,6 @@ CHECKS = [
             "Set retention_in_days to 7, 14, 30, or 90 depending on compliance requirements."
         ),
         "severity": "FAIL",
-        "patterns": [r"retention_in_days\s*=\s*[1-9]"],
-        "anti_patterns": [],
         "cross_resource": False,
         "est_saving": "$5–100/mo per log group",
     },
@@ -88,8 +82,6 @@ CHECKS = [
             "at $0.023/GB/month indefinitely. Transition to S3-IA after 30 days, Glacier after 90."
         ),
         "severity": "WARN",
-        "patterns": [r'resource\s+"aws_s3_bucket_lifecycle_configuration"'],
-        "anti_patterns": [],
         "cross_resource": True,
         "est_saving": "20–80% S3 storage cost",
     },
@@ -99,13 +91,11 @@ CHECKS = [
         "id": "C-006",
         "name": "EBS / RDS volumes using gp2 instead of gp3",
         "description": (
-            "aws_ebs_volume or aws_db_instance resources using type = \"gp2\". "
+            "aws_ebs_volume or aws_db_instance resources using type/storage_type = \"gp2\". "
             "gp3 provides the same baseline performance (3,000 IOPS, 125 MB/s throughput) "
             "at 20% lower cost with no architecture change required."
         ),
         "severity": "WARN",
-        "patterns": [r'type\s*=\s*"gp3"'],
-        "anti_patterns": [r'type\s*=\s*"gp2"'],
         "cross_resource": False,
         "est_saving": "20% on EBS/RDS storage",
     },
@@ -120,8 +110,6 @@ CHECKS = [
             "(HTML, CSS, JS, JSON) at no additional cost."
         ),
         "severity": "WARN",
-        "patterns": [r"compress\s*=\s*true"],
-        "anti_patterns": [r"compress\s*=\s*false"],
         "cross_resource": False,
         "est_saving": "20–80% CloudFront bandwidth cost",
     },
@@ -131,14 +119,12 @@ CHECKS = [
         "id": "C-008",
         "name": "Fargate tasks hardcoded at maximum CPU/memory",
         "description": (
-            "aws_ecs_task_definition with cpu = \"4096\" or memory = \"8192\" as defaults. "
+            "aws_ecs_task_definition with cpu = 4096 (maximum). "
             "Fargate billing is per vCPU-hour and GB-hour. Over-provisioned tasks "
             "for workloads that don't need this capacity waste 30–70% of compute cost. "
             "Profile actual usage and right-size."
         ),
         "severity": "WARN",
-        "patterns": [],
-        "anti_patterns": [r'cpu\s*=\s*"?4096"?'],
         "cross_resource": False,
         "est_saving": "30–70% Fargate cost",
     },
@@ -153,8 +139,6 @@ CHECKS = [
             "for the same duration. Use Lambda Power Tuning to find the optimal memory setting."
         ),
         "severity": "WARN",
-        "patterns": [],
-        "anti_patterns": [r"memory_size\s*=\s*3008"],
         "cross_resource": False,
         "est_saving": "Up to 6x Lambda cost reduction",
     },
@@ -169,11 +153,6 @@ CHECKS = [
             "24/7 regardless of actual usage. Either switch to PAY_PER_REQUEST or add auto-scaling."
         ),
         "severity": "FAIL",
-        "patterns": [
-            r'billing_mode\s*=\s*"PAY_PER_REQUEST"',
-            r'resource\s+"aws_appautoscaling_target"',
-        ],
-        "anti_patterns": [r'billing_mode\s*=\s*"PROVISIONED"'],
         "cross_resource": True,
         "est_saving": "40–80% DynamoDB cost at variable traffic",
     },
@@ -183,13 +162,11 @@ CHECKS = [
         "id": "C-011",
         "name": "Elastic IPs allocated without guaranteed association",
         "description": (
-            "aws_eip resources defined without a clear association to a running resource "
-            "(NAT Gateway or EC2 instance). AWS charges $0.005/hr (~$3.65/mo) for every "
-            "allocated EIP not attached to a running instance."
+            "More aws_eip resources are defined than can be accounted for by NAT Gateways, "
+            "EC2 instances, and explicit aws_eip_association resources. "
+            "AWS charges $0.005/hr (~$3.65/mo) for every allocated EIP not attached to a running instance."
         ),
         "severity": "WARN",
-        "patterns": [r'resource\s+"aws_eip_association"', r'instance\s*=\s*aws_instance'],
-        "anti_patterns": [r'resource\s+"aws_eip"'],
         "cross_resource": True,
         "est_saving": "$3.65/mo per idle EIP",
     },
@@ -199,14 +176,12 @@ CHECKS = [
         "id": "C-012",
         "name": "Lambda connecting to RDS without RDS Proxy",
         "description": (
-            "aws_lambda_function references an RDS endpoint (via environment variables or SSM) "
+            "aws_lambda_function and aws_db_instance/aws_rds_cluster coexist "
             "but no aws_db_proxy is defined. Lambda opens a new DB connection per invocation. "
             "At scale this exhausts RDS connection limits, requiring a larger (more expensive) "
             "RDS instance class. RDS Proxy pools connections and allows using a smaller instance."
         ),
         "severity": "FAIL",
-        "patterns": [r'resource\s+"aws_db_proxy"'],
-        "anti_patterns": [],
         "cross_resource": True,
         "est_saving": "1–2 RDS instance size reduction ($50–500/mo)",
     },
@@ -216,14 +191,11 @@ CHECKS = [
         "id": "C-013",
         "name": "No reserved capacity for stable long-running resources",
         "description": (
-            "RDS, ElastiCache, or Redshift instances are defined without corresponding "
-            "reserved instance purchase comments or aws_rds_reserved_instance resources. "
-            "On-demand pricing for stable workloads costs 40–60% more than 1-year reserved pricing. "
-            "Flag for FinOps review if these resources run 24/7."
+            "RDS or ElastiCache instances are defined without corresponding reserved instance "
+            "resources. On-demand pricing for stable workloads costs 40–60% more than 1-year "
+            "reserved pricing. Flag for FinOps review if these resources run 24/7."
         ),
         "severity": "INFO",
-        "patterns": [r"reserved", r"aws_rds_reserved_instance", r"aws_elasticache_reserved_cache_node"],
-        "anti_patterns": [],
         "cross_resource": False,
         "est_saving": "40–60% on RDS/ElastiCache/Redshift",
     },
@@ -233,13 +205,10 @@ CHECKS = [
         "id": "C-014",
         "name": "Multi-AZ RDS enabled on what appears to be non-production",
         "description": (
-            "aws_db_instance with multi_az = true in a module or workspace that appears "
-            "to be non-production (name/path contains 'dev', 'staging', 'test', 'sandbox'). "
-            "Multi-AZ doubles RDS cost. Non-prod environments rarely require it."
+            "aws_db_instance with multi_az = true. Multi-AZ doubles RDS cost. "
+            "Verify this is intentional for production — non-prod environments rarely require it."
         ),
         "severity": "WARN",
-        "patterns": [],
-        "anti_patterns": [r"multi_az\s*=\s*true"],
         "cross_resource": False,
         "est_saving": "50% RDS cost in non-prod environments",
     },
@@ -249,14 +218,11 @@ CHECKS = [
         "id": "C-015",
         "name": "Large S3 buckets without Intelligent-Tiering",
         "description": (
-            "S3 buckets used for data lake, archives, or ML datasets have no lifecycle rule "
-            "transitioning objects to S3 Intelligent-Tiering. For buckets with unpredictable "
-            "access patterns, Intelligent-Tiering automatically moves objects between tiers "
-            "and can save 40–68% on storage costs."
+            "S3 buckets exist but no lifecycle rule transitions objects to S3 Intelligent-Tiering. "
+            "For buckets with unpredictable access patterns, Intelligent-Tiering automatically moves "
+            "objects between tiers and can save 40–68% on storage costs."
         ),
         "severity": "INFO",
-        "patterns": [r"INTELLIGENT_TIERING", r"intelligent.tiering"],
-        "anti_patterns": [],
         "cross_resource": False,
         "est_saving": "40–68% on infrequently accessed S3 objects",
     },
@@ -269,12 +235,9 @@ CHECKS = [
             "aws_sfn_state_machine with type = \"STANDARD\" (or default) for workflows that run "
             "at high frequency. STANDARD costs $0.025 per 1,000 state transitions. EXPRESS costs "
             "$0.00001 per invocation + $0.00001667 per GB-second. At 1M executions/day, "
-            "STANDARD costs ~$750/mo vs EXPRESS ~$1/mo. Switch to EXPRESS for short-lived, "
-            "high-volume workflows (< 5 minutes duration)."
+            "STANDARD costs ~$750/mo vs EXPRESS ~$1/mo."
         ),
         "severity": "WARN",
-        "patterns": [r'type\s*=\s*"EXPRESS"'],
-        "anti_patterns": [r'type\s*=\s*"STANDARD"'],
         "cross_resource": True,
         "est_saving": "10–1000x cost reduction for high-volume workflows",
     },
@@ -285,14 +248,11 @@ CHECKS = [
         "name": "API Gateway stage with caching disabled",
         "description": (
             "aws_api_gateway_stage defined without cache_cluster_enabled = true. "
-            "Every API request invokes the backend Lambda or integration, incurring Lambda "
-            "invocation costs. For read-heavy APIs with cacheable responses, enabling "
-            "API Gateway caching ($0.02/hr for 0.5 GB cache) can eliminate 50–90% of "
-            "Lambda invocations and reduce latency significantly."
+            "Every API request invokes the backend Lambda or integration. For read-heavy APIs "
+            "with cacheable responses, enabling API Gateway caching ($0.02/hr for 0.5 GB cache) "
+            "can eliminate 50–90% of Lambda invocations."
         ),
         "severity": "WARN",
-        "patterns": [r"cache_cluster_enabled\s*=\s*true"],
-        "anti_patterns": [r"cache_cluster_enabled\s*=\s*false"],
         "cross_resource": True,
         "est_saving": "50–90% Lambda invocation cost for read-heavy APIs",
     },
@@ -304,13 +264,10 @@ CHECKS = [
         "description": (
             "aws_sqs_queue with receive_wait_time_seconds = 0 (default) uses short polling. "
             "Short polling returns immediately even when the queue is empty, generating "
-            "empty API calls billed at $0.40/million requests. At 1M polls/day with a "
-            "low-traffic queue, this wastes ~$12/mo in empty ReceiveMessage calls. "
+            "empty API calls billed at $0.40/million requests. "
             "Set receive_wait_time_seconds = 20 (long polling) to eliminate empty calls."
         ),
         "severity": "WARN",
-        "patterns": [r"receive_wait_time_seconds\s*=\s*(?:1[0-9]?|20)"],
-        "anti_patterns": [r"receive_wait_time_seconds\s*=\s*0"],
         "cross_resource": False,
         "est_saving": "$5–50/mo per high-traffic queue",
     },
@@ -323,12 +280,9 @@ CHECKS = [
             "aws_ecr_repository defined without a corresponding aws_ecr_lifecycle_policy. "
             "Container images accumulate silently — each tag pushed retains all layers. "
             "A busy CI/CD pipeline pushing daily can accumulate hundreds of GB at $0.10/GB/month. "
-            "Add a lifecycle policy to expire untagged images after 1 day and keep only "
-            "the last N tagged images."
+            "Add a lifecycle policy to expire untagged images after 1 day and keep only the last N tagged images."
         ),
         "severity": "WARN",
-        "patterns": [r'resource\s+"aws_ecr_lifecycle_policy"'],
-        "anti_patterns": [],
         "cross_resource": True,
         "est_saving": "$10–200/mo depending on image churn rate",
     },
@@ -340,14 +294,10 @@ CHECKS = [
         "description": (
             "aws_kinesis_stream with a fixed shard_count and no stream_mode_details block "
             "setting stream_mode = \"ON_DEMAND\". Fixed shards are billed at $0.015/shard-hr "
-            "regardless of utilization. At 10 shards, that's $108/mo even at 0% throughput. "
-            "On-Demand mode scales automatically and charges only for actual throughput used "
-            "($0.08 per million records + $0.04/GB). For variable traffic, On-Demand saves "
-            "40–80% over provisioned shards."
+            "regardless of utilization. On-Demand mode scales automatically and charges only "
+            "for actual throughput used. For variable traffic, On-Demand saves 40–80% over fixed shards."
         ),
         "severity": "WARN",
-        "patterns": [r'stream_mode\s*=\s*"ON_DEMAND"'],
-        "anti_patterns": [],
         "cross_resource": False,
         "est_saving": "40–80% Kinesis cost for variable workloads",
     },
@@ -357,16 +307,12 @@ CHECKS = [
         "id": "C-021",
         "name": "ECS/EKS workloads using on-demand only (no Spot capacity)",
         "description": (
-            "aws_ecs_service or aws_ecs_capacity_provider defined without a FARGATE_SPOT "
-            "capacity provider strategy. Fargate Spot is 60–70% cheaper than Fargate on-demand "
-            "for stateless, interruption-tolerant workloads. A mixed strategy "
-            "(e.g. 70% Spot, 30% on-demand) saves 40–50% overall with minimal availability risk. "
-            "For EKS, node groups should include a Spot instance policy via aws_eks_node_group "
-            "or Karpenter with spot provisioner."
+            "aws_ecs_service defined without a FARGATE_SPOT capacity_provider_strategy, "
+            "or aws_eks_node_group without capacity_type = \"SPOT\". "
+            "Fargate Spot is 60–70% cheaper than on-demand for stateless, interruption-tolerant workloads. "
+            "A mixed strategy (70% Spot, 30% on-demand) saves 40–50% overall with minimal availability risk."
         ),
         "severity": "WARN",
-        "patterns": [r"FARGATE_SPOT", r"spot_price", r"mixed_instances_policy", r"capacity_type\s*=\s*\"SPOT\""],
-        "anti_patterns": [],
         "cross_resource": True,
         "est_saving": "40–70% on Fargate/EC2 compute cost",
     },

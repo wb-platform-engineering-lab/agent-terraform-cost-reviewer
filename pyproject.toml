@@ -25,6 +25,7 @@ classifiers = [
 ]
 dependencies = [
     "anthropic>=0.40.0",
+    "python-hcl2>=3.0.0",
 ]
 
 [project.scripts]

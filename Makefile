@@ -23,8 +23,8 @@ test:
 	@$(PYTHON) -c "from terraform_cost_reviewer.cli import main; print('cli OK')"
 	@$(PYTHON) -c "from terraform_cost_reviewer import tools, report, rubric; print('modules OK')"
 	@$(PYTHON) -c "from terraform_cost_reviewer.rubric import CHECKS; print(f'checks OK ({len(CHECKS)} loaded)')"
-	@$(PYTHON) -c "from terraform_cost_reviewer.tools import run_cost_checks; r = run_cost_checks('./examples/bad_infra'); assert '0/21' in r, 'bad_infra should score 0/21'; print('bad_infra OK (0/21)')"
-	@$(PYTHON) -c "from terraform_cost_reviewer.tools import run_cost_checks; r = run_cost_checks('./examples/good_infra'); assert '19/21' in r or '18/21' in r, 'good_infra should score 18+/21'; print('good_infra OK')"
+	@$(PYTHON) -c "from terraform_cost_reviewer.tools import run_cost_checks; r = run_cost_checks('./examples/bad_infra'); assert '0/21' in r, f'bad_infra should score 0/21, got: {[l for l in r.splitlines() if \"TOTAL\" in l]}'; print('bad_infra OK (0/21)')"
+	@$(PYTHON) -c "from terraform_cost_reviewer.tools import run_cost_checks; r = run_cost_checks('./examples/good_infra'); ok = any(f'{n}/21' in r for n in range(18, 22)); assert ok, f'good_infra should score 18+/21, got: {[l for l in r.splitlines() if \"TOTAL\" in l]}'; print('good_infra OK')"
 	@echo "All checks passed."
 
 clean:
