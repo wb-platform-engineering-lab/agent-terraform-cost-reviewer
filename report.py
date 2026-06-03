@@ -310,7 +310,9 @@ def parse_report(text: str) -> dict:
 
     # ── Build single Cost Optimization pillar ────────────────────────
     passing = sum(1 for c in checks if c["status"] == "pass")
-    total   = len(checks) if checks else 15
+    # Use overall_score denominator as the canonical total (more reliable than
+    # counting section headers which the agent may not emit for passing checks)
+    total = overall_score[1] if overall_score and overall_score[1] > len(checks) else (len(checks) or 15)
     has_fail = any(c["status"] == "fail" for c in checks)
     has_warn = any(c["status"] == "warn" for c in checks)
     pillar_status = "fail" if has_fail else ("warn" if has_warn else "pass")
