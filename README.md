@@ -8,7 +8,7 @@
 
 An AI agent that reads your Terraform codebase and identifies **architectural cost anti-patterns** that standard security scanners like Checkov, tfsec, and Trivy cannot detect.
 
-Powered by Claude (Haiku 4.5). Produces a scored HTML report with specific file references, estimated monthly savings, and concrete fixes. Runs **21 checks** across compute, storage, networking, database, and architecture patterns.
+Powered by Claude Haiku 4.5. Produces a scored HTML report with specific file references, estimated monthly savings, and concrete fixes — across **21 checks** covering compute, storage, networking, database, and architecture patterns.
 
 ---
 
@@ -54,16 +54,72 @@ All checks focus on cost inefficiencies that require understanding resource rela
 
 ---
 
+## Quick Start
+
+### Prerequisites
+
+- Python 3.10+
+- An Anthropic API key ([get one here](https://console.anthropic.com))
+
+> **Cost:** a typical run uses ~15k–40k tokens with Haiku 4.5 — roughly **$0.01–0.05 per scan**.
+
+### Install
+
+```bash
+# From GitHub
+pip install git+https://github.com/wb-platform-engineering-lab/agent-terraform-cost-reviewer.git
+
+# From source
+git clone https://github.com/wb-platform-engineering-lab/agent-terraform-cost-reviewer.git
+cd agent-terraform-cost-reviewer
+pip install .
+
+# macOS with Homebrew Python (externally managed environment)
+python3 -m venv .venv && source .venv/bin/activate
+pip install .
+```
+
+### Configure
+
+```bash
+export ANTHROPIC_API_KEY=your-key-here
+```
+
+### Run
+
+```bash
+# Review a Terraform codebase
+terraform-cost-review ./path/to/your/terraform
+
+# Fail CI if score drops below 80%
+terraform-cost-review ./terraform --fail-under 80
+
+# Quiet mode + save report to a directory
+terraform-cost-review ./terraform --quiet --output-dir reports/
+
+# Fixed output filename (predictable artifact paths in CI)
+terraform-cost-review ./terraform --output-dir reports/ --output-file cost-review
+
+# Check version
+terraform-cost-review --version
+
+# Run against the included examples
+terraform-cost-review ./examples/bad_infra   # → 0/21 (all anti-patterns)
+terraform-cost-review ./examples/good_infra  # → ~19/21 (near-perfect)
+```
+
+---
+
 ## How It Works
 
 The agent runs 5 tools in sequence:
 
 ```
-1. list_files          → discover all .tf files and module structure
+1. list_files           → discover all .tf files and module structure
 2. build_resource_graph → parse HCL, extract resource relationships and cross-resource flags
-3. run_cost_checks     → run all 15 automated regex checks
-4. read_file           → targeted reads on files flagged by the graph (max 2)
-5. write report        → cross-reference graph + checks into findings with file/line refs
+3. run_cost_checks      → run all 21 automated checks against the codebase
+4. read_file            → targeted reads on files flagged by the graph (max 2)
+5. write report         → cross-reference graph + checks into findings with file/line refs
 ```
 
 ### The Resource Graph
@@ -84,23 +140,48 @@ The agent runs 5 tools in sequence:
          — objects may accumulate indefinitely (C-005)
 ```
 
-This graph is what enables findings that cross file boundaries — something rule-based scanners structurally cannot do.
+This graph enables findings that cross file boundaries — something rule-based scanners structurally cannot do.
 
 ---
 
 ## Output
 
-The agent produces:
+Each run produces:
 
-1. **Terminal output** — findings per check as it runs
-2. **HTML report** — saved as `cost_review_<target>_<timestamp>.html`
+1. **Terminal output** — live findings per check as the agent runs
+2. **HTML report** — richly formatted, saved to `--output-dir` if specified
+3. **JSON summary** — machine-readable artifact for CI/CD integration
+
+### HTML Report
 
 The HTML report includes:
-- Overall score (X/15 checks passing)
-- Executive summary with total estimated monthly savings
-- Per-finding breakdown with file references, anti-pattern explanation, fix, and estimated saving
+- Overall score and grade (PASS / AT RISK / FAIL)
+- Estimated total monthly savings across all findings
+- Per-finding breakdown: file references, anti-pattern explanation, fix, and estimated saving
 - Prioritized action list (top 3 highest-impact fixes)
-- Full rendered report
+
+### JSON Output
+
+The JSON report (`cost-review.json`) is written alongside the HTML report and is suitable for CI/CD parsing:
+
+```json
+{
+  "score_pct": 43,
+  "grade": "FAIL",
+  "passing": 9,
+  "failing": 12,
+  "total": 21,
+  "savings_label": "$200–1200/mo",
+  "failing_checks": ["C-001", "C-003", "C-004", "C-005", "C-009", "C-010"],
+  "action_items": [
+    "Consolidate 3 NAT Gateways to a single centralized egress (C-001) — saves $200–500/mo",
+    "Replace CloudWatch schedule polling with aws_lambda_event_source_mapping (C-003) — saves $14/mo",
+    "Add retention_in_days to all CloudWatch log groups (C-004) — saves $5–100/mo"
+  ],
+  "target": "./terraform",
+  "generated_at": "2026-01-15T10:23:45"
+}
+```
 
 ### Example Finding
 
@@ -124,6 +205,89 @@ Est. saving:  ~$14/mo (scales with message volume)
 
 ---
 
+## CI/CD Integration
+
+### GitHub Actions
+
+Add `.github/workflows/cost-review.yml` to your repository:
+
+```yaml
+name: Terraform Cost Review
+
+on:
+  pull_request:
+    paths: ["**.tf", "**.tfvars"]
+  push:
+    branches: [main]
+    paths: ["**.tf", "**.tfvars"]
+  workflow_dispatch:
+
+jobs:
+  cost-review:
+    runs-on: ubuntu-latest
+    steps:
+      - uses: actions/checkout@v4
+      - uses: actions/setup-python@v5
+        with:
+          python-version: "3.11"
+          cache: pip
+          cache-dependency-path: pyproject.toml
+
+      - run: pip install git+https://github.com/wb-platform-engineering-lab/agent-terraform-cost-reviewer.git
+      - run: mkdir -p reports/
+
+      - name: Run cost review
+        env:
+          ANTHROPIC_API_KEY: ${{ secrets.ANTHROPIC_API_KEY }}
+        run: terraform-cost-review . --quiet --output-dir reports/ --output-file cost-review --fail-under 70
+
+      - uses: actions/upload-artifact@v4
+        if: always()
+        with:
+          name: cost-review-${{ github.run_number }}
+          path: reports/
+          retention-days: 30
+```
+
+Required secret: `ANTHROPIC_API_KEY` (Settings → Secrets and variables → Actions).
+
+A fully-featured workflow with automatic PR comments is included at [`.github/workflows/cost-review.yml`](.github/workflows/cost-review.yml).
+
+### GitLab CI
+
+Add to your `.gitlab-ci.yml`:
+
+```yaml
+terraform-cost-review:
+  stage: test
+  image: python:3.11-slim
+  before_script:
+    - pip install git+https://github.com/wb-platform-engineering-lab/agent-terraform-cost-reviewer.git --quiet
+    - mkdir -p reports/
+  script:
+    - terraform-cost-review . --quiet --output-dir reports/ --output-file cost-review --fail-under 70
+  artifacts:
+    when: always
+    paths: [reports/]
+    expire_in: 30 days
+  rules:
+    - if: '$CI_PIPELINE_SOURCE == "merge_request_event"'
+      changes: ["**/*.tf", "**/*.tfvars"]
+```
+
+Required CI/CD variable: `ANTHROPIC_API_KEY` (Settings → CI/CD → Variables, mark as Masked).
+
+A fully-featured pipeline with automatic MR notes is included at [`.gitlab-ci.yml`](.gitlab-ci.yml).
+
+### Exit Codes
+
+| Code | Meaning |
+|---|---|
+| `0` | Review completed successfully (or score ≥ `--fail-under` threshold) |
+| `1` | Score below `--fail-under` threshold, or fatal error (missing API key, no .tf files found) |
+
+---
+
 ## Versus Checkov / tfsec / Trivy
 
 | Capability | Checkov | tfsec | This tool |
@@ -134,65 +298,9 @@ Est. saving:  ~$14/mo (scales with message volume)
 | Estimated savings per finding | ❌ | ❌ | ✅ |
 | Understands polling vs. event-driven | ❌ | ❌ | ✅ |
 | Detects missing resource (e.g. no RDS Proxy) | ❌ | ❌ | ✅ |
-| HTML scored report | ❌ | ❌ | ✅ |
+| HTML scored report + JSON artifact | ❌ | ❌ | ✅ |
 
 **This tool complements Checkov — run both.** Checkov catches security misconfigurations. This catches architectural cost inefficiencies.
-
----
-
-## Quick Start
-
-### Prerequisites
-
-- Python 3.10+
-- An Anthropic API key ([get one here](https://console.anthropic.com))
-
-> **Cost:** a typical run uses ~15k–40k tokens with Haiku 4.5 — roughly **$0.01–0.05 per scan**.
-
-### Install
-
-```bash
-# Option A — from GitHub
-pip install git+https://github.com/wb-platform-engineering-lab/agent-terraform-cost-reviewer.git
-
-# Option B — from source
-git clone https://github.com/wb-platform-engineering-lab/agent-terraform-cost-reviewer.git
-cd agent-terraform-cost-reviewer
-pip install .
-
-# macOS (Homebrew Python — externally managed)
-python3 -m venv .venv && source .venv/bin/activate
-pip install .
-```
-
-### Configure
-
-```bash
-export ANTHROPIC_API_KEY=your-key-here
-```
-
-### Run
-
-```bash
-# Against your own Terraform codebase
-terraform-cost-review ./path/to/your/terraform
-
-# Fail CI if score drops below 80%
-terraform-cost-review ./terraform --fail-under 80 --output-dir reports/
-
-# Quiet mode (spinner + one summary line — ideal for CI)
-terraform-cost-review ./terraform --quiet --output-dir reports/
-
-# Fixed output filename (useful in CI for predictable artifact paths)
-terraform-cost-review ./terraform --output-file cost-report --output-dir reports/
-
-# Check version
-terraform-cost-review --version
-
-# Against the included examples
-terraform-cost-review ./examples/bad_infra   # → 0/21, all findings
-terraform-cost-review ./examples/good_infra  # → 19/21, near perfect
-```
 
 ---
 
@@ -200,10 +308,9 @@ terraform-cost-review ./examples/good_infra  # → 19/21, near perfect
 
 ```
 agent-terraform-cost-reviewer/
-├── pyproject.toml                        — Package definition, entry point
+├── pyproject.toml                        — Package definition and entry point
 ├── Makefile                              — make install / make demo / make test
 ├── agent.py                              — Backward-compat shim (python3 agent.py still works)
-├── run.sh                                — Demo script
 ├── terraform_cost_reviewer/              — Installable package
 │   ├── __init__.py                       — Version
 │   ├── cli.py                            — Agent loop, CLI flags, error handling
@@ -242,7 +349,6 @@ resource "aws_dynamodb_table" "sessions" {
   billing_mode   = "PROVISIONED"
   read_capacity  = 100
   write_capacity = 100
-  # no aws_appautoscaling_target
 }
 
 # C-004: Log groups with no retention
@@ -290,13 +396,13 @@ resource "aws_cloudwatch_log_group" "logs" {
 
 ## Configuration
 
-Key settings in `agent.py`:
+Key settings in `terraform_cost_reviewer/cli.py`:
 
 ```python
-MODEL            = "claude-haiku-4-5-20251001"  # fast and cheap for code review
-MAX_ITERATIONS   = 15                            # max agent loop iterations
-MAX_TOKENS_INPUT = 80_000                        # token budget before stopping
-MAX_OUTPUT_TOKENS = 6144                         # max tokens per response
+MODEL             = "claude-haiku-4-5-20251001"  # fast and cheap for code review
+MAX_ITERATIONS    = 15                            # max agent loop iterations
+MAX_TOKENS_INPUT  = 80_000                        # token budget before stopping
+MAX_OUTPUT_TOKENS = 6144                          # max tokens per response
 ```
 
 To use a more capable model for large or complex codebases:
