@@ -288,19 +288,35 @@ A fully-featured pipeline with automatic MR notes is included at [`.gitlab-ci.ym
 
 ---
 
-## Versus Checkov / tfsec / Trivy
+## How It Fits With Other Tools
 
-| Capability | Checkov | tfsec | This tool |
+This tool is not a replacement for Checkov or Infracost — it fills a different gap.
+
+| Capability | Checkov | Infracost | This tool |
 |---|---|---|---|
-| Per-resource security checks | ✅ 1000+ rules | ✅ | ❌ not the focus |
-| Cross-resource relationship reasoning | Partial (graph policies) | ❌ | ✅ core feature |
-| Architectural cost anti-patterns | ❌ | ❌ | ✅ |
-| Estimated savings per finding | ❌ | ❌ | ✅ |
-| Understands polling vs. event-driven | ❌ | ❌ | ✅ |
-| Detects missing resource (e.g. no RDS Proxy) | ❌ | ❌ | ✅ |
-| HTML scored report + JSON artifact | ❌ | ❌ | ✅ |
+| Security misconfiguration detection | Excellent | — | Not the focus |
+| Cost delta from `terraform plan` | — | Excellent | Not the focus |
+| Cross-resource cost architecture review | Limited | — | Strong |
+| Architectural pattern recommendations | Limited | — | Strong |
+| Cost savings heuristics per finding | No | No | Yes (approximate ranges) |
+| Actual pricing from AWS price list | No | Yes | No |
+| CI/CD integration | Yes | Yes | Yes |
+| Machine-readable report (JSON/SARIF) | Yes | Yes | Yes (JSON) |
 
-**This tool complements Checkov — run both.** Checkov catches security misconfigurations. This catches architectural cost inefficiencies.
+**The right mental model is a three-layer stack:**
+
+```
+Security review      →  Checkov / tfsec / Trivy
+Cost delta review    →  Infracost (plan-based)
+Architectural review →  terraform-cost-reviewer (pattern-based)
+```
+
+Each layer answers a different question:
+- *Is this configuration secure?* → Checkov
+- *How much will this change cost?* → Infracost
+- *Is this architecture unnecessarily expensive?* → this tool
+
+A note on savings estimates: the dollar ranges shown per finding (e.g. `$100–500/mo`) are heuristics based on typical usage patterns, not calculations from actual AWS pricing data. They are useful for prioritization, not budgeting. For precise cost deltas, use Infracost.
 
 ---
 
@@ -314,7 +330,7 @@ agent-terraform-cost-reviewer/
 ├── terraform_cost_reviewer/              — Installable package
 │   ├── __init__.py                       — Version
 │   ├── cli.py                            — Agent loop, CLI flags, error handling
-│   ├── rubric.py                         — 21 cost checks with patterns and savings estimates
+│   ├── rubric.py                         — 21 cost checks: metadata, descriptions, savings estimates
 │   ├── tools.py                          — list_files, read_file, build_resource_graph, run_cost_checks
 │   └── report.py                         — HTML + JSON report generator (Tailwind CSS)
 └── examples/
