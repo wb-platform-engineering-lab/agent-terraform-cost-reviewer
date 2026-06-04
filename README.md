@@ -105,26 +105,40 @@ terraform-cost-review --version
 
 # Run against the included examples
 terraform-cost-review ./examples/bad_infra   # → 0/21 (all anti-patterns)
-terraform-cost-review ./examples/good_infra  # → ~19/21 (near-perfect)
+terraform-cost-review ./examples/good_infra  # → ~20/21 (near-perfect)
 ```
 
 ---
 
 ## How It Works
 
+### What Claude does vs. what the code does
+
+The tool is split into two layers. This split is intentional and worth understanding:
+
+**Deterministic layer (python-hcl2 + explicit rules)**
+All 21 checks are evaluated by code, not by AI. The HCL parser extracts an AST from every `.tf` file, giving exact Python-typed attribute values (`billing_mode == "PROVISIONED"`, `memory_size == 3008`, `compress is False`). Each check is an explicit rule against this parsed graph. Results are exact — not probabilistic.
+
+**Claude synthesis layer**
+Claude receives the resource graph and check results, then synthesises them into a narrative report: cross-referencing findings across files, explaining the anti-pattern in context, writing the fix, and estimating impact. This is where the "AI" value sits — not in the detection, but in the explanation and prioritisation.
+
+This means the tool has a deterministic floor (checks always run the same way) with an AI ceiling (the report quality scales with model capability).
+
+### Agent loop
+
 The agent runs 5 tools in sequence:
 
 ```
 1. list_files           → discover all .tf files and module structure
-2. build_resource_graph → parse HCL, extract resource relationships and cross-resource flags
-3. run_cost_checks      → run all 21 automated checks against the codebase
+2. build_resource_graph → parse HCL with python-hcl2, extract resource graph and cross-resource flags
+3. run_cost_checks      → run all 21 deterministic checks against the parsed AST
 4. read_file            → targeted reads on files flagged by the graph (max 2)
 5. write report         → cross-reference graph + checks into findings with file/line refs
 ```
 
 ### The Resource Graph
 
-`build_resource_graph` is what separates this tool from Checkov. It parses all `.tf` files and emits cross-resource flags:
+`build_resource_graph` parses all `.tf` files with python-hcl2 and emits cross-resource flags:
 
 ```
 ⚠️ RISK: Lambda + SQS + CloudWatch schedule found, but NO event_source_mapping
@@ -432,18 +446,23 @@ MODEL = "claude-sonnet-4-6"
 ## Limitations
 
 - **Static analysis only** — reviews declared Terraform code, not live infrastructure state. Drift between code and deployed resources is not detected.
-- **HCL parsing is regex-based** — works for standard Terraform patterns but may miss values inside complex expressions (`var.enable_x ? "gp2" : "gp3"`).
-- **Module sources not fetched** — community modules (e.g. `terraform-aws-modules/rds/aws`) are referenced but their internals are not analyzed.
-- **Savings estimates are approximate** — based on typical usage patterns, not your actual traffic or pricing tier.
+- **Dynamic expressions are skipped** — the HCL parser (python-hcl2) extracts literal values accurately, but cannot evaluate computed values: `var.storage_type`, `local.env == "prod" ? "gp3" : "gp2"`, or `for_each` expansions. Resources whose relevant attributes are expressions are skipped rather than guessed.
+- **Dynamic blocks not expanded** — `dynamic` blocks and `count`/`for_each` are parsed as-is. A resource repeated 10 times via `for_each` appears once in the graph.
+- **Module sources not fetched** — community modules (e.g. `terraform-aws-modules/rds/aws`) are referenced but their internals are not analysed. Only resources declared directly in `.tf` files in the target directory are checked.
+- **Savings estimates are approximate** — dollar ranges are heuristics based on typical usage patterns, not calculations from the AWS price list. Use Infracost for precise cost deltas.
 - **Not a replacement for Checkov** — this tool finds architectural cost issues, not security misconfigurations.
 
 ---
 
 ## Related Projects
 
+**Run alongside this tool:**
+- [Checkov](https://github.com/bridgecrewio/checkov) — Static analysis for IaC security misconfigurations (1000+ rules, complementary not competing)
+- [Infracost](https://github.com/infracost/infracost) — Cost estimation from `terraform plan` output (actual pricing data, pre-deploy cost delta)
+- [tfsec](https://github.com/aquasecurity/tfsec) — Lightweight security scanner for Terraform
+
+**From the same lab:**
 - [agent-waf-reviewer](https://github.com/wb-platform-engineering-lab/agent-waf-reviewer) — AI agent that reviews AI agent codebases against the Well-Architected Framework for AI Agents
-- [Checkov](https://github.com/bridgecrewio/checkov) — Static analysis for IaC security (complementary, not competing)
-- [Infracost](https://github.com/infracost/infracost) — Cost estimation for Terraform plan output (pre-deploy cost delta, not architectural review)
 
 ---
 
