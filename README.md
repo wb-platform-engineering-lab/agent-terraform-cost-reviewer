@@ -88,8 +88,13 @@ export ANTHROPIC_API_KEY=your-key-here
 ### Run
 
 ```bash
-# Review a Terraform codebase
+# Review a Terraform codebase (AI-assisted, requires ANTHROPIC_API_KEY)
 terraform-cost-review ./path/to/your/terraform
+
+# Plan-based analysis — no API key needed, fully resolved values
+terraform plan -out=plan.tfplan
+terraform show -json plan.tfplan > plan.json
+terraform-cost-review ./terraform --plan plan.json
 
 # Fail CI if score drops below 80%
 terraform-cost-review ./terraform --fail-under 80
@@ -107,6 +112,28 @@ terraform-cost-review --version
 terraform-cost-review ./examples/bad_infra   # → 0/21 (all anti-patterns)
 terraform-cost-review ./examples/good_infra  # → ~20/21 (near-perfect)
 ```
+
+### Suppress false positives
+
+Create `.tfreview.yaml` in your Terraform root:
+
+```yaml
+suppress:
+  - id: C-014
+    reason: "Multi-AZ intentional — staging mirrors prod for DR drills"
+  - id: C-013
+    reason: "Reserved instances managed via FinOps system, not in Terraform"
+```
+
+Or use inline comments directly in `.tf` files:
+
+```hcl
+resource "aws_db_instance" "staging" {
+  multi_az = true  # tfreview:ignore:C-014 intentional for DR testing
+}
+```
+
+Suppressed checks are excluded from the score denominator and shown as `⊘ SKIP` in output. Both methods can be combined.
 
 ---
 
@@ -293,6 +320,25 @@ Required CI/CD variable: `ANTHROPIC_API_KEY` (Settings → CI/CD → Variables, 
 
 A fully-featured pipeline with automatic MR notes is included at [`.gitlab-ci.yml`](.gitlab-ci.yml).
 
+### Plan-based CI (no API key required)
+
+For mature codebases where variables and modules hide attribute values from source analysis, use `--plan` to get fully resolved values from the Terraform plan:
+
+```yaml
+# GitHub Actions example
+- name: Generate plan
+  run: |
+    terraform init
+    terraform plan -out=plan.tfplan
+    terraform show -json plan.tfplan > plan.json
+
+- name: Run cost review (plan mode)
+  run: terraform-cost-review . --plan plan.json --output-dir reports/ --fail-under 70
+  # No ANTHROPIC_API_KEY needed — deterministic checks only
+```
+
+Plan mode produces a JSON report but no HTML. It is faster and requires no API key, making it suitable as a strict CI gate.
+
 ### Exit Codes
 
 | Code | Meaning |
@@ -445,9 +491,9 @@ MODEL = "claude-sonnet-4-6"
 
 ## Limitations
 
-- **Static analysis only** — reviews declared Terraform code, not live infrastructure state. Drift between code and deployed resources is not detected.
-- **Dynamic expressions are skipped** — the HCL parser (python-hcl2) extracts literal values accurately, but cannot evaluate computed values: `var.storage_type`, `local.env == "prod" ? "gp3" : "gp2"`, or `for_each` expansions. Resources whose relevant attributes are expressions are skipped rather than guessed.
-- **Dynamic blocks not expanded** — `dynamic` blocks and `count`/`for_each` are parsed as-is. A resource repeated 10 times via `for_each` appears once in the graph.
+- **AWS-only** — all 21 checks target `aws_*` resources. GCP, Azure, and other providers are not supported. The tool will warn if no AWS resources are found.
+- **Dynamic expressions are skipped in source mode** — the HCL parser (python-hcl2) extracts literal values accurately, but cannot evaluate computed values: `var.storage_type`, `local.env == "prod" ? "gp3" : "gp2"`. Resources whose relevant attributes are expressions are skipped rather than guessed. Use `--plan` mode to get fully resolved values.
+- **Dynamic blocks not expanded in source mode** — `dynamic` blocks and `count`/`for_each` are parsed as-is. A resource repeated 10 times via `for_each` appears once in the graph. `--plan` mode expands all instances correctly.
 - **Module sources not fetched** — community modules (e.g. `terraform-aws-modules/rds/aws`) are referenced but their internals are not analysed. Only resources declared directly in `.tf` files in the target directory are checked.
 - **Savings estimates are approximate** — dollar ranges are heuristics based on typical usage patterns, not calculations from the AWS price list. Use Infracost for precise cost deltas.
 - **Not a replacement for Checkov** — this tool finds architectural cost issues, not security misconfigurations.

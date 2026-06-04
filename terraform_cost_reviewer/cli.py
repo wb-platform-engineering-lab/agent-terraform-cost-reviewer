@@ -252,6 +252,83 @@ file references, concrete fixes, and estimated monthly savings per issue."""
 
 
 # ─────────────────────────────────────────────
+# Plan-based review (deterministic, no Claude)
+# ─────────────────────────────────────────────
+
+def run_plan_review(plan_path: str, target_path: str, quiet: bool = False) -> dict:
+    """
+    Run the 21 cost checks against a terraform show -json plan file.
+
+    Returns a structured results dict. No API key required — purely deterministic.
+    """
+    from .plan_parser import parse_plan_file, plan_summary
+    from .suppress import load_suppressions
+    from .hcl_parser import by_type_index
+    from .rubric import CHECKS
+    from . import tools as t
+
+    parsed = parse_plan_file(plan_path)
+    sups = load_suppressions(target_path)
+
+    if not quiet:
+        print(f"\n{'═'*60}")
+        print(f"  Terraform Cost Reviewer  v{__version__}  [plan mode]")
+        print(f"  Plan:   {os.path.abspath(plan_path)}")
+        print(f"  Target: {os.path.abspath(target_path)}")
+        print(f"{'═'*60}")
+        print(f"  {plan_summary(parsed)}")
+        if parsed["parse_errors"]:
+            for e in parsed["parse_errors"]:
+                print(f"  ⚠  {e}")
+        if sups:
+            print(f"  Suppressions active: {', '.join(sorted(sups.keys()))}")
+        print()
+
+    checks_output = t.run_cost_checks(target_path, suppressions=sups, parsed=parsed)
+
+    if not quiet:
+        print(checks_output)
+
+    byt = by_type_index(parsed)
+    active = [c for c in CHECKS if c["id"] not in sups]
+    suppressed = [c for c in CHECKS if c["id"] in sups]
+    total_pass = 0
+    failing, warning, skipped_ids = [], [], []
+
+    for check in active:
+        status_key, _ = t._evaluate_check(check["id"], byt)
+        if status_key == "pass":
+            total_pass += 1
+        elif status_key == "fail":
+            failing.append(check["id"])
+        elif status_key == "warn":
+            warning.append(check["id"])
+
+    for check in suppressed:
+        skipped_ids.append(check["id"])
+
+    denom = len(active)
+    score_pct = int(total_pass / denom * 100) if denom else 0
+    grade = "PASS" if score_pct >= 75 else ("AT RISK" if score_pct >= 40 else "FAIL")
+
+    return {
+        "score_pct":       score_pct,
+        "grade":           grade,
+        "passing":         total_pass,
+        "total":           denom,
+        "suppressed":      len(skipped_ids),
+        "source":          "plan",
+        "plan_file":       os.path.abspath(plan_path),
+        "tf_version":      parsed.get("tf_version"),
+        "failing_checks":  failing,
+        "warning_checks":  warning,
+        "skipped_checks":  skipped_ids,
+        "savings_label":   "N/A — use Infracost for precise cost deltas",
+        "action_items":    [],
+    }
+
+
+# ─────────────────────────────────────────────
 # JSON summary
 # ─────────────────────────────────────────────
 
@@ -317,6 +394,15 @@ def _parse_args(argv=None) -> argparse.Namespace:
         help="Base filename for reports (without extension). Default: cost_review_<name>_<timestamp>.",
     )
     parser.add_argument(
+        "--plan", default=None, metavar="FILE",
+        help=(
+            "Path to terraform show -json output (plan.json). "
+            "Enables plan-based analysis: variable references and for_each are fully resolved. "
+            "Runs deterministic checks only — no AI narration, no API key required. "
+            "Generate with: terraform plan -out=plan.tfplan && terraform show -json plan.tfplan > plan.json"
+        ),
+    )
+    parser.add_argument(
         "--version", action="version", version=f"%(prog)s {__version__}",
     )
     return parser.parse_args(argv)
@@ -330,12 +416,53 @@ def main(argv=None) -> None:
         print(f"Error: '{args.target}' is not a directory", file=sys.stderr)
         sys.exit(2)
 
-    # ── Validate API key ──────────────────────────────────────────────
+    os.makedirs(args.output_dir, exist_ok=True)
+
+    # ─────────────────────────────────────────────────────────────────
+    # PLAN MODE — deterministic, no Claude, no API key required
+    # ─────────────────────────────────────────────────────────────────
+    if args.plan:
+        if not os.path.isfile(args.plan):
+            print(f"Error: plan file '{args.plan}' not found.", file=sys.stderr)
+            sys.exit(2)
+
+        results = run_plan_review(args.plan, args.target, quiet=args.quiet)
+
+        # Write JSON report
+        base = args.output_file or "cost-review-plan"
+        json_path = os.path.join(args.output_dir, f"{base}.json")
+        with open(json_path, "w", encoding="utf-8") as f:
+            json.dump(results, f, indent=2)
+
+        score_pct = results["score_pct"]
+        suppressed_note = f"  suppressed={results['suppressed']}" if results["suppressed"] else ""
+        print(
+            f"\n[cost-review] score={score_pct}%  "
+            f"passing={results['passing']}/{results['total']}  "
+            f"failures={len(results['failing_checks'])}"
+            f"{suppressed_note}  "
+            f"source=plan  json={json_path}"
+        )
+
+        if args.fail_under is not None and score_pct < args.fail_under:
+            print(
+                f"[cost-review] FAILED — score {score_pct}% is below threshold {args.fail_under}%",
+                file=sys.stderr,
+            )
+            sys.exit(1)
+        sys.exit(0)
+
+    # ─────────────────────────────────────────────────────────────────
+    # SOURCE MODE — AI-assisted review via Claude agent loop
+    # ─────────────────────────────────────────────────────────────────
+
+    # Validate API key (only needed for source mode)
     if not os.environ.get("ANTHROPIC_API_KEY"):
         print(
             "Error: ANTHROPIC_API_KEY is not set.\n"
             "Export it with: export ANTHROPIC_API_KEY=your-key\n"
-            "Get a key at: https://console.anthropic.com",
+            "Get a key at: https://console.anthropic.com\n"
+            "Tip: for plan-based analysis without an API key, use --plan plan.json",
             file=sys.stderr,
         )
         sys.exit(2)
@@ -351,8 +478,6 @@ def main(argv=None) -> None:
 
     if not args.quiet:
         print(f"Found {tf_count} .tf file(s) — starting review…")
-
-    os.makedirs(args.output_dir, exist_ok=True)
 
     review = run_review(args.target, quiet=args.quiet)
 

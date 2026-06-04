@@ -786,16 +786,37 @@ def _evaluate_check(check_id: str, byt: dict) -> tuple[str, str]:
 # run_cost_checks
 # ─────────────────────────────────────────────
 
-def run_cost_checks(path: str) -> str:
-    """Run all rubric checks against the Terraform codebase using hcl2-parsed data."""
+def run_cost_checks(path: str, suppressions: dict | None = None, parsed: dict | None = None) -> str:
+    """
+    Run all 21 rubric checks against the Terraform codebase.
+
+    Args:
+        path:         Root directory of the Terraform codebase.
+        suppressions: Dict of check_id → reason loaded by suppress.load_suppressions().
+                      Suppressed checks are excluded from pass/fail counts.
+        parsed:       Pre-parsed resource dict (from hcl_parser or plan_parser).
+                      If None, the codebase at `path` is parsed with hcl2.
+    """
     from .rubric import CHECKS
 
-    parsed = parse_terraform_dir(path)
+    if parsed is None:
+        parsed = parse_terraform_dir(path)
     byt = by_type_index(parsed)
 
     if not parsed["resources"] and not parsed["parse_errors"]:
         return "No Terraform resources found."
 
+    # AWS-only scope check
+    aws_resources = [v for v in parsed["resources"].values() if v["type"].startswith("aws_")]
+    if parsed["resources"] and not aws_resources:
+        other_providers = sorted({v["type"].split("_")[0] for v in parsed["resources"].values()})[:5]
+        return (
+            "⚠️  No AWS resources detected — this tool currently supports only the AWS provider (aws_* resources).\n"
+            f"   Providers found: {', '.join(other_providers)}\n"
+            "   GCP, Azure, and other providers are not yet supported."
+        )
+
+    suppressions = suppressions or {}
     lines = [f"Cost checks ({parsed['file_count']} .tf files parsed)\n"]
 
     if parsed["parse_errors"]:
@@ -806,8 +827,11 @@ def run_cost_checks(path: str) -> str:
 
     findings = []
     total_pass = 0
+    total_suppressed = 0
+    active_checks = [c for c in CHECKS if c["id"] not in suppressions]
+    suppressed_checks = [c for c in CHECKS if c["id"] in suppressions]
 
-    for check in CHECKS:
+    for check in active_checks:
         status_key, detail = _evaluate_check(check["id"], byt)
 
         if status_key == "pass":
@@ -822,25 +846,40 @@ def run_cost_checks(path: str) -> str:
 
         findings.append((status_label, check, detail))
 
+    for check in suppressed_checks:
+        total_suppressed += 1
+        reason = suppressions[check["id"]]
+        detail = f"suppressed — {reason}" if reason else "suppressed via .tfreview.yaml or inline comment"
+        findings.append(("⊘  SKIP", check, detail))
+
     fail_count = sum(1 for s, _, _ in findings if "FAIL" in s)
     warn_count = sum(1 for s, _, _ in findings if "WARN" in s)
     info_count = sum(1 for s, _, _ in findings if "INFO" in s)
+    denom = len(active_checks)
 
+    suppress_note = f"  |  {total_suppressed} suppressed" if total_suppressed else ""
     lines.append(
-        f"Results: {total_pass}/{len(CHECKS)} passing  |  "
-        f"{fail_count} FAIL  |  {warn_count} WARN  |  {info_count} INFO\n"
+        f"Results: {total_pass}/{denom} passing  |  "
+        f"{fail_count} FAIL  |  {warn_count} WARN  |  {info_count} INFO{suppress_note}\n"
     )
+
+    # Sort: FAIL first, then WARN, then PASS, then INFO, then SKIP
+    order = {"❌": 0, "⚠": 1, "✅": 2, "ℹ": 3, "⊘": 4}
+    findings.sort(key=lambda x: order.get(x[0][0], 9))
 
     for status_label, check, detail in findings:
         cross = " [cross-resource]" if check["cross_resource"] else ""
         lines.append(f"{status_label} [{check['id']}] {check['name']}{cross}")
-        if "PASS" not in status_label:
+        if "PASS" not in status_label and "SKIP" not in status_label:
             desc = check["description"][:140] + ("…" if len(check["description"]) > 140 else "")
             lines.append(f"    → {detail}")
             lines.append(f"    ℹ  {desc}")
             lines.append(f"    💰 Est. saving: {check['est_saving']}")
+        elif "SKIP" in status_label:
+            lines.append(f"    → {detail}")
 
-    lines.append(f"\nTOTAL: {total_pass}/{len(CHECKS)} checks passing")
+    suppress_total_note = f" ({total_suppressed} suppressed)" if total_suppressed else ""
+    lines.append(f"\nTOTAL: {total_pass}/{denom} checks passing{suppress_total_note}")
     return "\n".join(lines)
 
 
@@ -859,6 +898,8 @@ def dispatch(tool_name: str, tool_input: dict) -> str:
         case "build_resource_graph":
             return build_resource_graph(tool_input.get("path", "."))
         case "run_cost_checks":
-            return run_cost_checks(tool_input.get("path", "."))
+            path = tool_input.get("path", ".")
+            from .suppress import load_suppressions
+            return run_cost_checks(path, suppressions=load_suppressions(path))
         case _:
             return f"Error: unknown tool '{tool_name}'"
