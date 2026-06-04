@@ -88,10 +88,10 @@ export ANTHROPIC_API_KEY=your-key-here
 ### Run
 
 ```bash
-# Review a Terraform codebase (AI-assisted, requires ANTHROPIC_API_KEY)
+# AI-assisted review (requires ANTHROPIC_API_KEY)
 terraform-cost-review ./path/to/your/terraform
 
-# Plan-based analysis — no API key needed, fully resolved values
+# Plan-based review — no API key needed, fully resolved values
 terraform plan -out=plan.tfplan
 terraform show -json plan.tfplan > plan.json
 terraform-cost-review ./terraform --plan plan.json
@@ -99,41 +99,13 @@ terraform-cost-review ./terraform --plan plan.json
 # Fail CI if score drops below 80%
 terraform-cost-review ./terraform --fail-under 80
 
-# Quiet mode + save report to a directory
-terraform-cost-review ./terraform --quiet --output-dir reports/
-
-# Fixed output filename (predictable artifact paths in CI)
-terraform-cost-review ./terraform --output-dir reports/ --output-file cost-review
-
-# Check version
-terraform-cost-review --version
+# Quiet mode + predictable report path (ideal for CI)
+terraform-cost-review ./terraform --quiet --output-dir reports/ --output-file cost-review
 
 # Run against the included examples
 terraform-cost-review ./examples/bad_infra   # → 0/21 (all anti-patterns)
 terraform-cost-review ./examples/good_infra  # → ~20/21 (near-perfect)
 ```
-
-### Suppress false positives
-
-Create `.tfreview.yaml` in your Terraform root:
-
-```yaml
-suppress:
-  - id: C-014
-    reason: "Multi-AZ intentional — staging mirrors prod for DR drills"
-  - id: C-013
-    reason: "Reserved instances managed via FinOps system, not in Terraform"
-```
-
-Or use inline comments directly in `.tf` files:
-
-```hcl
-resource "aws_db_instance" "staging" {
-  multi_az = true  # tfreview:ignore:C-014 intentional for DR testing
-}
-```
-
-Suppressed checks are excluded from the score denominator and shown as `⊘ SKIP` in output. Both methods can be combined.
 
 ---
 
@@ -246,6 +218,126 @@ Est. saving:  ~$14/mo (scales with message volume)
 
 ---
 
+## Plan-Based Analysis
+
+Plan mode runs the same 21 deterministic checks against `terraform show -json` output instead of `.tf` source files. Because the plan contains fully resolved values — variables substituted, `for_each` expanded, module internals visible — it produces more accurate results than source analysis for any codebase that uses variables or modules heavily.
+
+Plan mode does not call Claude. It is faster, has no API cost, and requires no `ANTHROPIC_API_KEY`.
+
+### When to use plan mode
+
+**Use plan mode when:**
+- Key attributes are controlled by variables (`var.billing_mode`, `var.instance_type`)
+- Resources are generated via `count` or `for_each`
+- Critical infrastructure lives inside community modules (`terraform-aws-modules/rds/aws`)
+- You want to use this tool as a strict, deterministic CI gate
+
+**Source mode is sufficient when:**
+- Attributes are hardcoded literals in `.tf` files
+- You don't have Terraform credentials or state available (e.g., first-pass review)
+- You want AI narrative output alongside the check results
+
+### Commands
+
+```bash
+# Step 1 — generate the plan file
+terraform init
+terraform plan -out=plan.tfplan
+terraform show -json plan.tfplan > plan.json
+
+# Step 2 — run the review (no ANTHROPIC_API_KEY needed)
+terraform-cost-review ./terraform --plan plan.json
+
+# With a CI threshold
+terraform-cost-review ./terraform --plan plan.json --fail-under 70 --output-dir reports/
+```
+
+### JSON output (plan mode)
+
+Plan mode writes a JSON report but no HTML. The schema differs from source mode — it includes `source`, `plan_path`, `tf_version`, `suppressed`, `warning_checks`, and `skipped_checks`, but does not include `savings_label` or `action_items` (those require Claude synthesis):
+
+```json
+{
+  "score_pct": 52,
+  "grade": "AT RISK",
+  "passing": 11,
+  "failing": 9,
+  "total": 21,
+  "suppressed": 1,
+  "failing_checks": ["C-001", "C-004", "C-005", "C-006", "C-008", "C-009", "C-010", "C-018", "C-020"],
+  "warning_checks": ["C-013"],
+  "skipped_checks": ["C-014"],
+  "source": "plan",
+  "target": "./terraform",
+  "plan_path": "/abs/path/to/plan.json",
+  "tf_version": "1.7.0",
+  "generated_at": "2026-01-15T10:23:45"
+}
+```
+
+### Plan mode limitations
+
+- No HTML report — JSON only
+- No AI narrative — deterministic checks only; the Claude synthesis layer is skipped
+- Requires `terraform init` and valid credentials to generate the plan
+- The plan reflects a specific variable set — results may differ across workspaces or environments
+
+---
+
+## Suppressing False Positives
+
+Some findings are expected for your specific context. A `C-014` flag for Multi-AZ RDS is correct behaviour in production — it is a false positive in a staging environment that intentionally uses Multi-AZ for parity testing.
+
+Two suppression mechanisms are provided. Suppressed checks are excluded from the score denominator and shown as `⊘ SKIP` in terminal output. A run with 2 suppressions scores `X/19` rather than `X/21`.
+
+### File-level suppression (`.tfreview.yaml`)
+
+Create `.tfreview.yaml` in your Terraform directory to suppress checks project-wide:
+
+```yaml
+# .tfreview.yaml
+suppress:
+  C-014: "Multi-AZ intentional — production parity required for disaster-recovery testing"
+  C-013: "Reserved instances managed outside Terraform via AWS Savings Plans"
+  C-001: "Multi-region NAT Gateways required by compliance boundary — no shared egress"
+```
+
+The value is a free-text reason that appears in the report alongside the `⊘ SKIP` marker. It is optional but strongly recommended for auditability.
+
+### Inline suppression
+
+Add a comment on the same line (or the line above) a resource block to suppress a single check for that specific resource:
+
+```hcl
+resource "aws_rds_cluster" "main" {
+  # tfreview:ignore:C-014 production parity — intentional Multi-AZ in staging
+  multi_az = true
+  ...
+}
+```
+
+Inline suppression takes precedence over file-level suppression for the same check ID.
+
+### Supported comment formats
+
+```hcl
+# tfreview:ignore:C-014
+# tfreview:ignore:C-014 reason text here
+# TFREVIEW:IGNORE:C-014 (case-insensitive)
+```
+
+### Score impact
+
+```
+Before suppression:   9/21 (43%)   FAIL
+After C-014 suppressed:  9/20 (45%)   FAIL
+After C-014 + C-013 suppressed:  9/19 (47%)   FAIL
+```
+
+Suppressed checks do not artificially inflate the score — only the denominator shrinks. A codebase that passes 9 active checks out of 19 still scores 47%, not 100%.
+
+---
+
 ## CI/CD Integration
 
 ### GitHub Actions
@@ -322,22 +414,38 @@ A fully-featured pipeline with automatic MR notes is included at [`.gitlab-ci.ym
 
 ### Plan-based CI (no API key required)
 
-For mature codebases where variables and modules hide attribute values from source analysis, use `--plan` to get fully resolved values from the Terraform plan:
+For codebases where variables or modules control key attribute values, use `--plan` to get fully resolved values. See [Plan-Based Analysis](#plan-based-analysis) for full details.
 
 ```yaml
-# GitHub Actions example
-- name: Generate plan
-  run: |
-    terraform init
-    terraform plan -out=plan.tfplan
-    terraform show -json plan.tfplan > plan.json
+# GitHub Actions — plan-based gate (no ANTHROPIC_API_KEY needed)
+jobs:
+  cost-review:
+    runs-on: ubuntu-latest
+    steps:
+      - uses: actions/checkout@v4
+      - uses: hashicorp/setup-terraform@v3
 
-- name: Run cost review (plan mode)
-  run: terraform-cost-review . --plan plan.json --output-dir reports/ --fail-under 70
-  # No ANTHROPIC_API_KEY needed — deterministic checks only
+      - name: Terraform init + plan
+        run: |
+          terraform init
+          terraform plan -out=plan.tfplan
+          terraform show -json plan.tfplan > plan.json
+
+      - uses: actions/setup-python@v5
+        with:
+          python-version: "3.11"
+      - run: pip install git+https://github.com/wb-platform-engineering-lab/agent-terraform-cost-reviewer.git
+
+      - name: Run cost review (plan mode)
+        run: terraform-cost-review . --plan plan.json --output-dir reports/ --fail-under 70
+
+      - uses: actions/upload-artifact@v4
+        if: always()
+        with:
+          name: cost-review-plan-${{ github.run_number }}
+          path: reports/cost-review.json
+          retention-days: 30
 ```
-
-Plan mode produces a JSON report but no HTML. It is faster and requires no API key, making it suitable as a strict CI gate.
 
 ### Exit Codes
 
@@ -389,9 +497,12 @@ agent-terraform-cost-reviewer/
 ├── agent.py                              — Backward-compat shim (python3 agent.py still works)
 ├── terraform_cost_reviewer/              — Installable package
 │   ├── __init__.py                       — Version
-│   ├── cli.py                            — Agent loop, CLI flags, error handling
+│   ├── cli.py                            — Agent loop, CLI flags, plan mode, error handling
 │   ├── rubric.py                         — 21 cost checks: metadata, descriptions, savings estimates
 │   ├── tools.py                          — list_files, read_file, build_resource_graph, run_cost_checks
+│   ├── hcl_parser.py                     — python-hcl2 AST parser; produces resource graph from .tf files
+│   ├── plan_parser.py                    — terraform show -json parser; same resource graph from plan output
+│   ├── suppress.py                       — .tfreview.yaml + inline comment suppression loader
 │   └── report.py                         — HTML + JSON report generator (Tailwind CSS)
 └── examples/
     ├── bad_infra/main.tf                 — Violates all 21 checks (score: 0%)
