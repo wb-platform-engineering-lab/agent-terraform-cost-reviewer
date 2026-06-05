@@ -32,7 +32,7 @@ from . import report as r
 # ─────────────────────────────────────────────
 
 MODEL = "claude-haiku-4-5-20251001"
-MAX_ITERATIONS = 15
+MAX_ITERATIONS = 25
 MAX_TOKENS_INPUT = 80_000
 MAX_OUTPUT_TOKENS = 6144
 
